@@ -1,17 +1,12 @@
 /*
-# Copyright (c) 2022 José Miguel Guerrero Hernández
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+Autor: Marvin Pancracio Manso.
+Partes implementadas:
+- Detección de pelota en 2D y proyección 3D
+- Detección de pelota en 3D y proyección 2D  (problemas a la hora de proyectar el punto en 2D)
+- Proyección líneas
+- Proyección de cubos en función del slider distance.
+- Funcionalidad extra:
+- 
 */
 
 #include <memory>
@@ -27,6 +22,8 @@
 #include <opencv2/imgproc/imgproc.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/dnn.hpp>
+#include "opencv2/core.hpp"
+
 
 #include "image_geometry/pinhole_camera_model.h"
 
@@ -81,6 +78,20 @@ float nmsThreshold = 0.4;  // Non-maximum suppression threshold
 int inpWidth = 416;  // Width of network's input image
 int inpHeight = 416; // Height of network's input image
 cv::Mat clone_img;
+cv::Mat circles_img;
+std::vector<cv::Point2f> k_center;
+std::vector<int> k_radius;
+
+const int MAX_CLUSTERS = 5;
+cv::Scalar colorTab[] =
+{
+  cv::Scalar(0, 0, 255),
+  cv::Scalar(0, 255, 0),
+  cv::Scalar(255, 100, 100),
+  cv::Scalar(255, 0, 255),
+  cv::Scalar(0, 255, 255)
+};
+
 
 class ComputerVisionSubscriber : public rclcpp::Node
 {
@@ -226,9 +237,9 @@ cv::Mat pink_filter_cv(const cv::Mat input_image) {
 
 cv::Mat balls_cv(const cv::Mat input_image) {
 
-  cv::Mat gray,out_image, blue_img;
+  cv::Mat gray,out_image, pink_img;
   out_image = input_image.clone();
-  blue_img = pink_filter_cv(input_image);
+  pink_img = pink_filter_cv(input_image);
   cvtColor(out_image, gray, CV_BGR2GRAY);
   
   cv::medianBlur(gray, gray, 5);
@@ -238,14 +249,17 @@ cv::Mat balls_cv(const cv::Mat input_image) {
                 175, 30, 1, 100 // change the last two parameters
           // (min_radius & max_radius) to detect larger circles
   );
+  //circles_img = gray;
   for( size_t i = 0; i < circles.size(); i++ )
   {
       cv::Vec3i c = circles[i];
       int radius = c[2];
       cv::Point2f center = cv::Point2f(c[0], c[1]);
+      k_center.push_back(center);
+      k_radius.push_back(radius);
       //point.push_back(center);
       // circle center
-      if (blue_img.at<uchar>(center) > 0) {
+      if (pink_img.at<uchar>(center) > 0) {
         point.push_back(center);
         cv::circle( out_image, center, 1, cv::Scalar(0,0,0), 3, cv::LINE_AA);
         cv::circle( out_image, center, radius, cv::Scalar(0,0,255), 3, cv::LINE_AA);
@@ -425,6 +439,65 @@ void person_detected(cv::Mat input_img) {
   postprocess(frame, outs);
 }
 
+// EXTRA K-MEANS.
+
+void k_means(cv::Mat input_img) {
+
+  cv::RNG rng(k_center.size());
+
+  for (;; ) {
+    int k, clusterCount = rng.uniform(2, k_center.size() + 1);
+    int i, sampleCount = rng.uniform(1, 1001);
+    cv::Mat points(sampleCount, 1, CV_32FC2), labels;
+
+    clusterCount = MIN(clusterCount, sampleCount);
+    std::vector<cv::Point2f> centers;
+
+    /* generate random sample from multigaussian distribution */
+    for (k = 0; k < clusterCount; k++) {
+      cv::Point center;
+      center.x = k_center[k].x;
+      center.y = k_center[k].y;
+      cv::Mat pointChunk = points.rowRange(
+        k * sampleCount / clusterCount,
+        k == clusterCount - 1 ? sampleCount :
+        (k + 1) * sampleCount / clusterCount);
+      rng.fill(
+        pointChunk, cv::RNG::RNG::NORMAL, cv::Scalar(center.x, center.y),
+        cv::Scalar(input_img.cols * 0.05, input_img.rows * 0.05));
+    }
+
+    cv::randShuffle(points, 1, &rng);
+
+    double compactness = cv::kmeans(
+      points, clusterCount, labels,
+      cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::COUNT, 10, 1.0),
+      3, cv::KMEANS_PP_CENTERS, centers);
+
+    input_img = cv::Scalar::all(0);
+
+    for (i = 0; i < sampleCount; i++) {
+      int clusterIdx = labels.at<int>(i);
+      cv::Point ipt = points.at<cv::Point2f>(i);
+      circle(input_img, ipt, 2, colorTab[clusterIdx], cv::FILLED, cv::LINE_AA);
+    }
+
+    for (i = 0; i < (int)k_center.size(); ++i) {
+      cv::Point2f c = k_center[i];
+      circle(input_img, c, k_radius[i], colorTab[i], 1, cv::LINE_AA);
+    }
+
+    std::cout << "Compactness: " << compactness << std::endl;
+    imshow("clusters", input_img);
+
+    char key = (char)cv::waitKey();
+    if (key == 27 || key == 'q' || key == 'Q') {    // 'ESC'
+      break;
+    }
+  }
+
+}
+
 
 cv::Mat image_processing(const cv::Mat in_image) 
 {
@@ -447,6 +520,15 @@ cv::Mat image_processing(const cv::Mat in_image)
       person_detected(in_image);
     }
   }
+
+  if (option_trackbar == op_KEY_2) {
+    out_image = balls_cv(out_image);
+    k_means(clone_img);
+    for( int i = 0; i < k_center.size(); i++){
+      std::cout << "cennter x: "<< k_center[i].x << " center y: " << k_center[i].y << std::endl;
+    }
+    out_image = clone_img;
+  }
   
   int key_pressed = cv::waitKey(200);
   person = 0;
@@ -454,6 +536,8 @@ cv::Mat image_processing(const cv::Mat in_image)
     // Pulse Esc to close the windows.
     rclcpp::shutdown();
   }
+  k_center.clear();
+  k_radius.clear();
   cv::imshow(window_name, out_image);
   return out_image;
 }
@@ -688,6 +772,9 @@ pcl::PointCloud<pcl::PointXYZRGB> pcl_processing(const pcl::PointCloud<pcl::Poin
   pcl::PointCloud<pcl::PointXYZRGB> temp_pointcloud = in_pointcloud;
   option_trackbar = cv::getTrackbarPos(trackbar_name_1, window_name);
 
+  if (option_trackbar == op_KEY_0) {
+    return temp_pointcloud;
+  }
   if(option_trackbar == op_KEY_1) 
   {person_detected(clone_img);
     if (person == 1) 
@@ -712,6 +799,10 @@ pcl::PointCloud<pcl::PointXYZRGB> pcl_processing(const pcl::PointCloud<pcl::Poin
     }
     
     //std::cout <<"x: " << t.transform.translation.x <<"y: " << t.transform.translation.y << "z: "<< t.transform.translation.z << std::endl;
+  }
+
+  if ( option_trackbar == op_KEY_2){
+    return temp_pointcloud;
   }
   square_pos_2 = square_pos;
   // limpiamos los vectores de puntos para evitar detecciones antiguas.
